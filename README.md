@@ -34,7 +34,7 @@ Your Nextcloud container needs a folder mounted at `/custom-services.d`. If it d
 Then, on the Docker host as root, replace the path with that folder and run:
 
 ```bash
-D=/path/to/appdata/nextcloud/custom-services; mkdir -p "$D" && curl -fsSL https://raw.githubusercontent.com/OWNER/nextcloud-autofix/main/nextcloud-autofix -o "$D/nextcloud-autofix" && chown root:root "$D/nextcloud-autofix" && chmod 755 "$D/nextcloud-autofix"
+D=/path/to/appdata/nextcloud/custom-services; mkdir -p "$D" && curl -fsSL https://raw.githubusercontent.com/relink2013/nextcloud-autofix/main/nextcloud-autofix -o "$D/nextcloud-autofix" && chown root:root "$D/nextcloud-autofix" && chmod 755 "$D/nextcloud-autofix"
 ```
 
 Restart the container. The LSIO image only runs files in that folder if they're owned by root, which is why the command sets the owner.
