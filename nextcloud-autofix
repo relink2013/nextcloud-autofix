@@ -1,0 +1,301 @@
+#!/usr/bin/with-contenv bash
+# shellcheck shell=bash
+#
+# nextcloud-autofix: a long-running LSIO custom service (s6) that keeps Nextcloud
+# healthy after image and app updates, without anyone opening the web UI.
+#
+# Install: copy to the folder mounted at /custom-services.d, owned by root, mode 0755.
+#
+# On container start (after LSIO's own `occ upgrade`), and again whenever the
+# Nextcloud or app versions change, it runs the usual post-update chores:
+#   occ upgrade (only if the database still needs it)
+#   db:add-missing-indices / -columns / -primary-keys
+#   maintenance:repair (with --include-expensive after a version change)
+#   maintenance:mimetype:update-db / update-js
+#   app:update --all (optional, see AUTOFIX_APP_UPDATES)
+# Every CHECK_INTERVAL it checks maintenance mode. If it is on, nothing that
+# legitimately needs it is running (upgrade, repair, updater) and it has been on
+# for STUCK_AFTER seconds, it finishes a pending upgrade if there is one and then
+# turns maintenance mode off. A failure that needs a person sends a Nextcloud
+# notification (shows in the desktop/mobile clients too) to NOTIFY_USER.
+#
+# Apps a Nextcloud upgrade turned off (Nextcloud disables apps that don't
+# declare support for the new version) are turned back on, but only once the
+# installed version declares support: until then it looks for a newer version
+# every APP_RETRY seconds and keeps waiting. Apps a person turns off are left off.
+# It can only know which apps an upgrade turned off from upgrades that happen
+# after it is installed.
+#
+# To keep maintenance mode on deliberately (manual work, a restore), create
+# /config/autofix.hold; the service leaves maintenance mode alone while it exists.
+#
+# Settings (optional, as container environment variables):
+#   AUTOFIX_CHECK_INTERVAL  seconds between checks          (default 600)
+#   AUTOFIX_STUCK_AFTER     seconds maintenance may stay on (default 1800)
+#   AUTOFIX_NOTIFY_USER     user to notify                  (default: first admin)
+#   AUTOFIX_APP_UPDATES     1 = update apps after core updates (default 1)
+#   AUTOFIX_APP_RETRY       seconds between looks for a compatible version (default 21600)
+#   AUTOFIX_NEVER_REENABLE  space-separated app ids never to turn back on
+
+CHECK_INTERVAL="${AUTOFIX_CHECK_INTERVAL:-600}"
+APP_RETRY="${AUTOFIX_APP_RETRY:-21600}"
+NEVER_REENABLE=" ${AUTOFIX_NEVER_REENABLE:-} "
+STUCK_AFTER="${AUTOFIX_STUCK_AFTER:-1800}"
+APP_UPDATES="${AUTOFIX_APP_UPDATES:-1}"
+NOTIFY_USER="${AUTOFIX_NOTIFY_USER:-}"
+
+STATE_DIR=/config/autofix
+LOG=/config/log/nextcloud-autofix.log
+HOLD=/config/autofix.hold
+OCC_PHP=/app/www/public/occ
+
+mkdir -p "$STATE_DIR" /config/log
+chown abc:abc "$STATE_DIR"
+
+log() {
+    local line
+    line="$(date '+%Y-%m-%d %H:%M:%S') [autofix] $*"
+    echo "$line"
+    echo "$line" >>"$LOG"
+}
+
+# Run occ as the web user, with a time limit. Output goes to the log.
+occ_run() {
+    local limit="$1"; shift
+    log "occ $*"
+    timeout "$limit" s6-setuidgid abc php "$OCC_PHP" --no-interaction "$@" </dev/null >>"$LOG" 2>&1
+    local rc=$?
+    [ $rc -ne 0 ] && log "occ $* exited with $rc"
+    return $rc
+}
+
+# occ whose output we need (quiet, short time limit).
+occ_out() {
+    timeout 120 s6-setuidgid abc php "$OCC_PHP" --no-interaction "$@" </dev/null 2>/dev/null
+}
+
+status_field() {   # status_field <key>  ->  value from `occ status --output=json`
+    occ_out status --output=json | php -r '$s=json_decode(stream_get_contents(STDIN),true); $v=$s[$argv[1]]??""; echo is_bool($v)?($v?"true":"false"):$v;' "$1"
+}
+
+notify() {
+    local user="$NOTIFY_USER"
+    if [ -z "$user" ]; then
+        user="$(occ_out group:list --output=json | php -r '$g=json_decode(stream_get_contents(STDIN),true); echo $g["admin"][0]??"";')"
+    fi
+    [ -n "$user" ] || return 0
+    occ_out notification:generate "$user" "Nextcloud autofix: $1" -l "${2:-$1}" >/dev/null || true
+}
+
+# Something that legitimately holds maintenance mode is running.
+busy() {
+    pgrep -f "occ (upgrade|maintenance:repair|maintenance:mode --on|maintenance:install|db:convert)" >/dev/null && return 0
+    pgrep -f "updater.phar" >/dev/null && return 0
+    [ -f /tmp/needs_upgrade ] && return 0   # LSIO init still upgrading
+    return 1
+}
+
+versions_fingerprint() {
+    { status_field versionstring; occ_out app:list --output=json; } | md5sum | cut -d' ' -f1
+}
+
+wait_until_ready() {
+    local i
+    for i in $(seq 1 120); do
+        [ "$(status_field installed)" = "true" ] && return 0
+        sleep 10
+    done
+    return 1
+}
+
+post_update_tasks() {
+    local expensive="$1"
+    log "running post-update tasks (expensive repair: $expensive)"
+
+    if [ "$(status_field needsDbUpgrade)" = "true" ]; then
+        occ_run 3600 upgrade || { notify "upgrade failed" "occ upgrade failed; see $LOG"; return 1; }
+    fi
+
+    occ_run 3600 db:add-missing-indices
+    occ_run 3600 db:add-missing-columns
+    occ_run 3600 db:add-missing-primary-keys
+
+    if [ "$expensive" = "yes" ]; then
+        occ_run 7200 maintenance:repair --include-expensive
+    else
+        occ_run 3600 maintenance:repair
+    fi
+    occ_run 1800 maintenance:mimetype:update-db
+    occ_run 600  maintenance:mimetype:update-js
+
+    if [ "$APP_UPDATES" = "1" ]; then
+        occ_run 1800 app:update --all
+        # an app update can bring its own migrations and indices
+        [ "$(status_field needsDbUpgrade)" = "true" ] && occ_run 3600 upgrade
+        occ_run 3600 db:add-missing-indices
+    fi
+
+    # Report anything still flagged, so it lands in the log.
+    occ_out setupchecks --output=json | php -r '
+        $r=json_decode(stream_get_contents(STDIN),true) ?: [];
+        foreach ($r as $cat=>$checks) foreach ($checks as $name=>$c)
+            if (in_array($c["severity"]??"", ["warning","error"])) echo "setup check $cat/$name: ".($c["severity"])." - ".strip_tags($c["description"]??"")."\n";' \
+        | while IFS= read -r l; do log "$l"; done
+    log "post-update tasks done"
+}
+
+# --- apps an upgrade turned off ---------------------------------------------
+
+APPS_FILE="$STATE_DIR/enabled-apps"     # apps enabled at the last check
+CORE_FILE="$STATE_DIR/core-version"     # Nextcloud version at the last check
+WATCH_FILE="$STATE_DIR/upgrade-disabled" # lines: "<app> <unix time of last update attempt>"
+
+enabled_apps() {
+    occ_out app:list --output=json | php -r '$a=json_decode(stream_get_contents(STDIN),true); if (!isset($a["enabled"])) exit(1); foreach (array_keys($a["enabled"]) as $k) echo "$k\n";' | sort
+}
+
+# Does the installed version of <app> declare support for the running Nextcloud?
+# Same rule as Nextcloud: compare as many version parts as min-version/max-version give.
+app_compatible() {
+    local path core
+    path="$(occ_out app:getpath "$1")" || return 1
+    core="$(status_field version)"
+    [ -n "$path" ] && [ -n "$core" ] || return 1
+    s6-setuidgid abc php -r '
+        $x = @simplexml_load_file($argv[1] . "/appinfo/info.xml");
+        if (!$x || !isset($x->dependencies->nextcloud)) exit(1);
+        $nc = $x->dependencies->nextcloud;
+        $core = explode(".", $argv[2]);
+        $cut = function ($v) use ($core) { return implode(".", array_slice($core, 0, count(explode(".", $v)))); };
+        $min = (string)$nc["min-version"]; $max = (string)$nc["max-version"];
+        if ($min !== "" && version_compare($cut($min), $min, "<")) exit(1);
+        if ($max !== "" && version_compare($cut($max), $max, ">")) exit(1);
+        exit(0);' "$path" "$core" </dev/null
+}
+
+track_apps() {
+    local now core prev_core current gone app
+    now=$(date +%s)
+    core="$(status_field versionstring)"
+    current="$(enabled_apps)" || return   # occ not answering: try again next time
+    [ -n "$current" ] || return
+    touch "$WATCH_FILE"
+
+    if [ -f "$APPS_FILE" ] && [ -f "$CORE_FILE" ]; then
+        prev_core="$(cat "$CORE_FILE")"
+        gone="$(comm -23 "$APPS_FILE" <(echo "$current"))"
+        for app in $gone; do
+            if [ "$core" != "$prev_core" ]; then
+                if [[ "$NEVER_REENABLE" == *" $app "* ]]; then
+                    log "the upgrade to $core turned $app off; AUTOFIX_NEVER_REENABLE keeps it off"
+                elif ! grep -q "^$app " "$WATCH_FILE"; then
+                    echo "$app 0" >>"$WATCH_FILE"
+                    log "the upgrade from $prev_core to $core turned $app off; it goes back on once a compatible version is installed"
+                fi
+            else
+                log "$app was turned off by hand: leaving it off"
+            fi
+        done
+    fi
+    # A watched app someone turned on again needs no more watching.
+    for app in $current; do
+        sed -i "/^$app /d" "$WATCH_FILE"
+    done
+    echo "$current" >"$APPS_FILE"
+    echo "$core" >"$CORE_FILE"
+}
+
+reenable_apps() {
+    local now app tried
+    now=$(date +%s)
+    [ -s "$WATCH_FILE" ] || return
+    [ "$(status_field maintenance)" = "false" ] || return
+    while read -r app tried; do
+        [ -n "$app" ] || continue
+        if ! app_compatible "$app" && [ $((now - ${tried:-0})) -ge "$APP_RETRY" ]; then
+            occ_run 1800 app:update "$app"
+            sed -i "s/^$app .*/$app $now/" "$WATCH_FILE"
+        fi
+        if app_compatible "$app"; then
+            if occ_run 1800 app:enable "$app"; then   # never --force
+                log "$app supports this Nextcloud again and is back on"
+                notify "$app is back on" "$app was turned off by a Nextcloud upgrade; a compatible version is installed and it has been turned back on."
+                sed -i "/^$app /d" "$WATCH_FILE"
+                occ_run 3600 db:add-missing-indices
+            else
+                notify "$app could not be turned back on" "$app declares support for this Nextcloud but enabling it failed; see $LOG"
+            fi
+        fi
+    done < <(cat "$WATCH_FILE")
+    track_apps
+}
+
+check_maintenance() {
+    local since_file="$STATE_DIR/maintenance-since" now since
+    now=$(date +%s)
+    if [ "$(status_field maintenance)" != "true" ]; then
+        rm -f "$since_file"
+        return
+    fi
+    if [ -f "$HOLD" ]; then
+        log "maintenance mode is on and $HOLD exists: leaving it on"
+        return
+    fi
+    if busy; then
+        echo "$now" >"$since_file"   # restart the clock while real work runs
+        return
+    fi
+    [ -f "$since_file" ] || { echo "$now" >"$since_file"; log "maintenance mode is on; watching it"; return; }
+    since=$(cat "$since_file")
+    if [ $((now - since)) -lt "$STUCK_AFTER" ]; then
+        return
+    fi
+
+    log "maintenance mode has been on for $(( (now - since) / 60 )) min with nothing running: fixing"
+    if [ "$(status_field needsDbUpgrade)" = "true" ]; then
+        if ! occ_run 3600 upgrade; then
+            notify "stuck in maintenance mode" "Nextcloud needs an upgrade that failed; maintenance mode left on. See $LOG"
+            echo "$now" >"$since_file"
+            return
+        fi
+    fi
+    occ_run 120 maintenance:mode --off
+    if [ "$(status_field maintenance)" = "false" ]; then
+        log "maintenance mode turned off"
+        notify "maintenance mode was stuck" "Maintenance mode was stuck on and has been turned off."
+        rm -f "$since_file"
+        post_update_tasks no
+    else
+        notify "stuck in maintenance mode" "Could not turn maintenance mode off; see $LOG"
+    fi
+}
+
+log "starting"
+if ! wait_until_ready; then
+    log "Nextcloud did not become ready in 20 minutes; checking again later"
+fi
+
+# Container start: LSIO may just have upgraded core (and turned apps off).
+track_apps
+fp_file="$STATE_DIR/fingerprint"
+fp="$(versions_fingerprint)"
+if [ "$fp" != "$(cat "$fp_file" 2>/dev/null)" ]; then
+    post_update_tasks yes
+else
+    post_update_tasks no
+fi
+versions_fingerprint >"$fp_file"
+reenable_apps
+
+while true; do
+    sleep "$CHECK_INTERVAL"
+    check_maintenance
+    track_apps
+    reenable_apps
+    fp="$(versions_fingerprint)"
+    if [ "$fp" != "$(cat "$fp_file" 2>/dev/null)" ] && [ "$(status_field maintenance)" = "false" ]; then
+        log "Nextcloud or app versions changed"
+        post_update_tasks yes
+        versions_fingerprint >"$fp_file"
+    fi
+done
