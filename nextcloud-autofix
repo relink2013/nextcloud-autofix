@@ -36,10 +36,17 @@
 #   AUTOFIX_APP_UPDATES     1 = update apps after core updates (default 1)
 #   AUTOFIX_APP_RETRY       seconds between looks for a compatible version (default 21600)
 #   AUTOFIX_NEVER_REENABLE  space-separated app ids never to turn back on
+#   AUTOFIX_SELFTEST        space-separated "app=occ-command" pairs (default: fangthumbs=fangthumbs:test).
+#                           An app listed here that no compatible version exists for is tried once per
+#                           Nextcloud version: its declared max-version is raised to the running major,
+#                           it's turned on and its command runs; it stays on only if the command succeeds,
+#                           else it's turned off and its info.xml put back. Only for apps you trust
+#                           (your own): it overrides Nextcloud's version check.
 
 CHECK_INTERVAL="${AUTOFIX_CHECK_INTERVAL:-600}"
 APP_RETRY="${AUTOFIX_APP_RETRY:-21600}"
 NEVER_REENABLE=" ${AUTOFIX_NEVER_REENABLE:-} "
+SELFTEST="${AUTOFIX_SELFTEST-fangthumbs=fangthumbs:test}"
 STUCK_AFTER="${AUTOFIX_STUCK_AFTER:-1800}"
 APP_UPDATES="${AUTOFIX_APP_UPDATES:-1}"
 NOTIFY_USER="${AUTOFIX_NOTIFY_USER:-}"
@@ -205,8 +212,44 @@ track_apps() {
     echo "$core" >"$CORE_FILE"
 }
 
+selftest_command() {   # selftest_command <app>  ->  its occ self-test command, if listed
+    local pair
+    for pair in $SELFTEST; do
+        [ "${pair%%=*}" = "$1" ] && { echo "${pair#*=}"; return 0; }
+    done
+    return 1
+}
+
+# Turns on an app that doesn't declare support for this Nextcloud, if its own self-test passes.
+selftest_app() {
+    local app="$1" command="$2" core major path info marker
+    core="$(status_field versionstring)"
+    marker="$STATE_DIR/selftested-$app"
+    [ "$(cat "$marker" 2>/dev/null)" = "$core" ] && return 1   # tried for this version already
+    echo "$core" >"$marker"
+    path="$(occ_out app:getpath "$app")"
+    info="$path/appinfo/info.xml"
+    [ -n "$path" ] && [ -f "$info" ] || return 1
+    major="${core%%.*}"
+    cp -p "$info" "$info.autofix-backup"
+    sed -i -E "s/(<nextcloud[^>]*max-version=\")[^\"]*\"/\1$major\"/" "$info"
+    log "$app has no version for Nextcloud $core: trying it with its self-test ($command)"
+    # shellcheck disable=SC2086
+    if occ_run 600 app:enable "$app" && occ_run 900 $command; then
+        rm -f "$info.autofix-backup"
+        log "$app passed its self-test on Nextcloud $core and stays on"
+        notify "$app is back on" "$app was turned off by the upgrade to Nextcloud $core; it passed its self-test and has been turned back on."
+        return 0
+    fi
+    occ_run 600 app:disable "$app"
+    mv -f "$info.autofix-backup" "$info"
+    log "$app failed its self-test on Nextcloud $core: turned off again"
+    notify "$app failed its self-test" "$app doesn't work on Nextcloud $core yet and stays off; see $LOG"
+    return 1
+}
+
 reenable_apps() {
-    local now app tried
+    local now app tried command
     now=$(date +%s)
     [ -s "$WATCH_FILE" ] || return
     [ "$(status_field maintenance)" = "false" ] || return
@@ -225,6 +268,8 @@ reenable_apps() {
             else
                 notify "$app could not be turned back on" "$app declares support for this Nextcloud but enabling it failed; see $LOG"
             fi
+        elif command="$(selftest_command "$app")" && selftest_app "$app" "$command"; then
+            sed -i "/^$app /d" "$WATCH_FILE"
         fi
     done < <(cat "$WATCH_FILE")
     track_apps

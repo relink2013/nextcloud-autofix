@@ -19,6 +19,8 @@ It runs inside the Nextcloud container as an s6 service (LSIO's `custom-services
 
 **Apps turned off by an upgrade.** When Nextcloud upgrades to a new major version, it turns off every app whose installed version doesn't declare support for it, without telling you. This service notices which apps an upgrade turned off and turns them back on once a compatible version is installed. It uses the same version rule as Nextcloud and never forces it. Until then it looks for a newer version every 6 hours and keeps waiting. Apps you turn off yourself are left alone.
 
+**Your own apps, with a self-test.** An app that will never get a new version for the new Nextcloud (your own, not from the App Store) can be listed in `AUTOFIX_SELFTEST` with an `occ` command that checks it. After an upgrade, the service raises the app's declared maximum version, turns it on and runs that command, once per Nextcloud version. The app stays on only if the command succeeds; otherwise it's turned off again and its `info.xml` put back. [FaNG Thumbs](https://github.com/relink2013/fang-thumbs) is listed by default.
+
 **Notifications.** Anything that needs a person is sent as a Nextcloud notification to the first admin, so it also shows up in the desktop and mobile apps.
 
 Everything it does is logged to `/config/log/nextcloud-autofix.log` inside the container, and to the container log.
@@ -53,6 +55,7 @@ All optional, set as environment variables on the Nextcloud container:
 | `AUTOFIX_APP_UPDATES` | `1` | `0` turns off automatic app updates after Nextcloud updates |
 | `AUTOFIX_APP_RETRY` | `21600` | Seconds between looks for a compatible version of an app an upgrade turned off |
 | `AUTOFIX_NEVER_REENABLE` | (none) | Space-separated app ids never to turn back on |
+| `AUTOFIX_SELFTEST` | `fangthumbs=fangthumbs:test` | Space-separated `app=occ-command` pairs: apps turned back on after an upgrade if their self-test passes. Only for apps you trust |
 
 ## Keeping maintenance mode on deliberately
 
