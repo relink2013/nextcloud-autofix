@@ -11,7 +11,7 @@ It runs inside the Nextcloud container as an s6 service (LSIO's `custom-services
 - `occ upgrade`, but only if the database still needs it
 - `db:add-missing-indices`, `db:add-missing-columns`, `db:add-missing-primary-keys`. These clear the "Database missing indices" warning.
 - `maintenance:repair`, with `--include-expensive` after a version change
-- `maintenance:mimetype:update-db` and `maintenance:mimetype:update-js`
+- `maintenance:mimetype:update-db`, so files get the right type after new types are added. Not `update-js`: it rewrites a signed core file, and Nextcloud would then warn that the integrity check failed.
 - `app:update --all`, which you can turn off
 - afterwards, it writes any setup warnings still shown on the admin page to its log
 

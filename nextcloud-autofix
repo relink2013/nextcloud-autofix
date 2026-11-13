@@ -11,7 +11,7 @@
 #   occ upgrade (only if the database still needs it)
 #   db:add-missing-indices / -columns / -primary-keys
 #   maintenance:repair (with --include-expensive after a version change)
-#   maintenance:mimetype:update-db / update-js
+#   maintenance:mimetype:update-db (not update-js: it rewrites a signed core file and trips the integrity check)
 #   app:update --all (optional, see AUTOFIX_APP_UPDATES)
 # Every CHECK_INTERVAL it checks maintenance mode. If it is on, nothing that
 # legitimately needs it is running (upgrade, repair, updater) and it has been on
@@ -133,7 +133,6 @@ post_update_tasks() {
         occ_run 3600 maintenance:repair
     fi
     occ_run 1800 maintenance:mimetype:update-db
-    occ_run 600  maintenance:mimetype:update-js
 
     if [ "$APP_UPDATES" = "1" ]; then
         occ_run 1800 app:update --all
